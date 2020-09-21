@@ -284,20 +284,12 @@ class IOSQ(object):
         self.ctrlr[0x1000+2*self.id*4] = tail
 
     def delete(self, qid=None):
-        def delete_io_sq_cpl(cdw0, status1):
-            if status1>>1:
-                logging.info("delete io sq fail: %d" % qid)
-            else:
-                self.id = 0
-
         if qid == None:
             qid = self.id
 
         logging.debug("delete sqid %d" % qid)
         if qid != 0:
-            self.ctrlr.send_cmd(0x00,
-                                cdw10 = qid,
-                                cb = delete_io_sq_cpl).waitdone()
+            self.ctrlr.send_cmd(0x00, cdw10=qid).waitdone()
 
 
 class IOCQ(object):
@@ -324,7 +316,6 @@ class IOCQ(object):
 
         assert qid < 64*1024 and qid >= 0
         assert qsize < 64*1024 and qsize > 0
-        assert iv < 2048, "a maximum of 2048 vectors are used"
 
         def create_io_cq_cpl(cdw0, status1):
             nonlocal status; status = status1>>1
@@ -370,20 +361,12 @@ class IOCQ(object):
         self.ctrlr[0x1000+(2*self.id+1)*4] = head
 
     def delete(self, qid=None):
-        def delete_io_cq_cpl(cdw0, status1):
-            if status1>>1:
-                logging.info("delete io cq fail: %d" % qid)
-            else:
-                self.id = 0
-
         if qid is None:
             qid = self.id
 
         logging.debug("delete cqid %d" % qid)
         if qid != 0:
-            self.ctrlr.send_cmd(0x04,
-                                cdw10 = qid,
-                                cb = delete_io_cq_cpl).waitdone()
+            self.ctrlr.send_cmd(0x04, cdw10=qid).waitdone()
 
 
 def test_create_delete_iocq(nvme0):
@@ -405,9 +388,13 @@ def test_create_delete_iocq(nvme0):
     with pytest.warns(UserWarning, match="ERROR status: 01/01"):
         cq = IOCQ(nvme0, 0, 5, buf)
 
-    # Invalid Queue Identifier
+    # Invalid interrupt vector
     with pytest.warns(UserWarning, match="ERROR status: 01/08"):
         cq = IOCQ(nvme0, 5, 5, buf, iv=2047, ien=True)
+
+    # Invalid interrupt vector
+    with pytest.warns(UserWarning, match="ERROR status: 01/08"):
+        cq = IOCQ(nvme0, 5, 5, buf, iv=2049, ien=True)
 
     cq = IOCQ(nvme0, 5, 5, buf, iv=5)
     with pytest.warns(UserWarning, match="ERROR status: 01/01"):
@@ -474,72 +461,11 @@ def test_send_single_cmd(nvme0):
     sq = IOSQ(nvme0, 1, 10, PRP(), cqid=1)
 
     # first cmd, invalid namespace
-    sq[0] = [8] + [0]*15
+    sq[0] = [4] + [0]*15
     sq.tail = 1
     time.sleep(0.1)
     status = (cq[0][3]>>17)&0x7ff
     assert status == 0x000b
-
-    sq.delete()
-    cq.delete()
-
-
-def test_send_cmd_2sq_1cq(nvme0):
-    cq = IOCQ(nvme0, 1, 10, PRP())
-    sq1 = IOSQ(nvme0, 1, 10, PRP(), cqid=1)
-    sq2 = IOSQ(nvme0, 2, 16, PRP(), cqid=1)
-
-    cdw = SQE(8, 0, 0)
-    cdw.nsid = 1  # namespace id
-    cdw.cid = 222
-    sq1[0] = cdw
-
-    sqe = SQE(*cdw)
-    assert sqe[1] == 1
-    sqe.cid = 111
-    sq2[0] = sqe
-    sq2.tail = 1
-    time.sleep(0.1)
-    sq1.tail = 1
-    time.sleep(0.1)
-
-    cqe = CQE(cq[0])
-    assert cqe.sct == 0
-    assert cqe.sc == 0
-    assert cqe.sqid == 2
-    assert cqe.sqhd == 1
-    assert cqe.p == 1
-    assert cqe.cid == 111
-
-    cqe = CQE(cq[1])
-    assert cqe.sct == 0
-    assert cqe.sc == 0
-    assert cqe.sqid == 1
-    assert cqe.sqhd == 1
-    assert cqe.p == 1
-    assert cqe.cid == 222
-
-    cq.head = 2
-
-    sq1.delete()
-    sq2.delete()
-    cq.delete()
-
-
-@pytest.mark.parametrize("qdepth", [7, 2, 3, 4, 5, 10, 16, 17, 31])
-def test_send_cmd_different_qdepth(nvme0, qdepth):
-    cq = IOCQ(nvme0, 3, qdepth, PRP())
-    sq = IOSQ(nvme0, 3, qdepth, PRP(), cqid=3)
-
-    # once again: first cmd, invalid namespace
-    for i in range(qdepth*3 + 3):
-        index = (i+1)%qdepth
-        sq[index-1] = [8, 1] + [0]*14
-        sq.tail = index
-        time.sleep(0.01)
-        assert (cq[index-1][3]>>17) == 0
-        assert (cq[index-1][2]&0xffff) == index
-        cq.head = index
 
     sq.delete()
     cq.delete()
@@ -575,8 +501,51 @@ def test_prp_and_prp_list_invalid():
     with pytest.raises(AssertionError):
         l[512] = Buffer()
 
+        
+@pytest.mark.parametrize("qdepth", [7, 2, 3, 4, 5, 10, 16, 17, 31])
+def test_send_cmd_different_qdepth(nvme0, qdepth):
+    cq = IOCQ(nvme0, 4, qdepth, PRP())
+    sq = IOSQ(nvme0, 4, qdepth, PRP(), cqid=4)
 
-def test_psd_write_2sq_1cq_prp_list(nvme0):
+    # once again: first cmd, invalid namespace
+    for i in range(qdepth*3 + 3):
+        index = (i+1)%qdepth
+        sq[index-1] = [0, 1] + [0]*14
+        sq.tail = index
+        time.sleep(0.01)
+        assert (cq[index-1][3]>>17) == 0
+        assert (cq[index-1][2]&0xffff) == index
+        cq.head = index
+
+    sq.delete()
+    cq.delete()
+    
+
+def test_send_cmd_2sq_1cq(nvme0):
+    cq = IOCQ(nvme0, 1, 10, PRP())
+    sq1 = IOSQ(nvme0, 1, 10, PRP(), cqid=1)
+    sq2 = IOSQ(nvme0, 2, 16, PRP(), cqid=1)
+
+    cdw = SQE(0, 0, 0)
+    cdw.nsid = 1  # namespace id
+    cdw.cid = 222
+    sq1[0] = cdw
+
+    sqe = SQE(*cdw)
+    assert sqe[1] == 1
+    sqe.cid = 111
+    sq2[0] = sqe
+    sq2.tail = 1
+    time.sleep(0.1)
+    sq1.tail = 1
+    time.sleep(0.1)
+
+    sq1.delete()
+    sq2.delete()
+    cq.delete()
+
+        
+def test_psd_write_2sq_1cq_prp_list(nvme0, subsystem):
     # cqid: 1, PC, depth: 120
     cq = IOCQ(nvme0, 1, 120, PRP(4096))
 
@@ -585,11 +554,6 @@ def test_psd_write_2sq_1cq_prp_list(nvme0):
     sq3 = IOSQ(nvme0, 3, 16, PRP(), cqid=1)
     # sqid: 5, depth: 100, so need 2 pages of memory
     sq5 = IOSQ(nvme0, 5, 64*64, PRP(4096*64), cqid=1)
-
-    with pytest.warns(UserWarning, match="ERROR status: 01/01"):
-        sq_invalid = IOSQ(nvme0, 5, 64*1024, PRP(4096*1024), cqid=1)
-    with pytest.warns(UserWarning, match="ERROR status: 01/02"):
-        sq_invalid = IOSQ(nvme0, 6, 64*1024, PRP(4096*1024), cqid=1)
 
     # IO command templates: opcode and namespace
     write_cmd = SQE(1, 1)
@@ -610,7 +574,7 @@ def test_psd_write_2sq_1cq_prp_list(nvme0):
 
     # write in sq5, lba5-lba16, 2 page, non aligned
     w2 = SQE(*write_cmd)
-    buf1 = PRP(ptype=32, pvalue=0xbbbbbbbb)
+    buf1 = PRP(ptype=32, pvalue=0xbbbbbbbd)
     buf1.offset = 2048
     w2.prp1 = buf1
     w2.prp2 = PRP(ptype=32, pvalue=0xcccccccc)
@@ -652,7 +616,7 @@ def test_psd_write_2sq_1cq_prp_list(nvme0):
     # verify read data
     while cq[2].p == 0: pass
     cq.head = 3
-    assert read_buf[0].data(0xfff, 0xffc) == 0xbbbbbbbb
+    assert read_buf[0].data(0xfff, 0xffc) == 0xbbbbbbbd
     assert read_buf[2].data(3, 0) == 0xcccccccc
     assert read_buf[2].data(0x1ff, 0x1fc) == 0xcccccccc
 
@@ -750,4 +714,76 @@ def test_write_before_power_cycle(nvme0, subsystem):
 
     sq.delete()
     cq.delete()
+
+
+def test_invalid_sq_doorbell(nvme0):
+    cq = IOCQ(nvme0, 4, 16, PRP())
+    sq1 = IOSQ(nvme0, 4, 16, PRP(), cqid=4)
+
+    write_cmd = SQE(1, 1)
+    write_cmd.prp1 = PRP()
+    prp_list = PRPList()
+    prp_list[0] = PRP()
+    prp_list[1] = PRP()
+    prp_list[2] = PRP()
+    write_cmd.prp2 = prp_list
+    write_cmd[10] = 0
+    write_cmd[12] = 31
+    write_cmd.cid = 123
+
+    sq1[0] = write_cmd
+    write_cmd.cid = 567
+    sq1.tail = 17
+
+    # wait for the controller to respond the error
+    time.sleep(0.1)
+    with pytest.warns(UserWarning, match="AER notification is triggered: 0x10100"):
+        nvme0.getfeatures(7).waitdone()
+    sq1.delete()
+    cq.delete()
+    
+
+def test_write_read_verify(nvme0, nvme0n1):
+    cq = IOCQ(nvme0, 1, 1024, PRP(1024*64))
+    sq = IOSQ(nvme0, 1, 1024, PRP(1024*64), cqid=1)
+
+    write_cmd = SQE(1, 1)
+    write_cmd[12] = 7  # 4K write
+    buf_list = []
+    for i in range(10):
+        buf = PRP(ptype=32, pvalue=0x01010101*i)
+        buf_list.append(buf)
+        write_cmd.prp1 = buf
+        write_cmd.cid = i
+        write_cmd[10] = i
+        sq[i] = write_cmd
+    sq.tail = 10
+    
+    while cq[9].p == 0: pass
+    sq.delete()
+    cq.delete()
+    
+    # read after reset with outstanding writes
+    cq = IOCQ(nvme0, 1, 1024, PRP(1024*64))
+    sq = IOSQ(nvme0, 1, 1024, PRP(1024*64), cqid=1)
+
+    read_cmd = SQE(2, 1)
+    read_cmd[12] = 7  # 4K read
+    buf_list = []
+    for i in range(10):
+        buf = PRP()
+        buf_list.append(buf)
+        read_cmd.prp1 = buf
+        read_cmd.cid = i
+        read_cmd[10] = i
+        sq[i] = read_cmd
+    sq.tail = 10
+
+    while cq[9].p == 0: pass
+    for i in range(10):
+        logging.info(cq[i].cid)
+        assert buf_list[cq[i].cid][0] == cq[i].cid
+    sq.delete()
+    cq.delete()
+
 

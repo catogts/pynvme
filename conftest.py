@@ -95,7 +95,9 @@ def nvme0n1(nvme0):
 
 @pytest.fixture(scope="function")
 def qpair(nvme0):
-    ret = d.Qpair(nvme0, 64)
+    num_of_entry = (nvme0.cap & 0xffff) + 1
+    num_of_entry = min(1024, num_of_entry)
+    ret = d.Qpair(nvme0, num_of_entry)
     yield ret
     ret.delete()
 
@@ -124,7 +126,7 @@ def verify(nvme0n1):
 def aer():
     assert False, "aer fixture is replaced by admin command nvme0.aer()"
 
-    
+
 @pytest.hookimpl(tryfirst=True, hookwrapper=True)
 def pytest_runtest_makereport(item, call):
     # execute all other hooks to obtain the report object
